@@ -1,9 +1,72 @@
+import io, datetime as dt
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# -------------------- PDF builder --------------------
+def build_pdf(df, mode_label, kpi, title="IDS Alerts Report"):
+    """Return PDF bytes for download."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=12*mm, rightMargin=12*mm, topMargin=12*mm, bottomMargin=12*mm,
+        title=title,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="tiny", fontSize=7, leading=8))
+    elements = []
+
+    # Header
+    now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    elements.append(Paragraph(f"<b>{title}</b>", styles["Heading1"]))
+    elements.append(Paragraph(f"Generated: {now} • Mode: {mode_label}", styles["Normal"]))
+    elements.append(Spacer(1, 6))
+
+    # KPIs
+    kpi_line = " • ".join([
+        f"Total alerts: <b>{kpi.get('total','—')}</b>",
+        f"% High severity: <b>{kpi.get('pct_high','—')}</b>",
+        f"Avg confidence: <b>{kpi.get('avg_conf','—')}</b>",
+        f"Avg Flesch: <b>{kpi.get('avg_flesch','—')}</b>",
+    ])
+    elements.append(Paragraph(kpi_line, styles["Normal"]))
+    elements.append(Spacer(1, 6))
+
+    # Table
+    cols_pref = ["timestamp","attack_type","severity","confidence","src_ip","dst_ip","summary"]
+    cols = [c for c in cols_pref if c in df.columns]
+    data = [cols]
+    for _, r in df[cols].iterrows():
+        row = []
+        for c in cols:
+            val = str(r[c])[:200] + ("…" if len(str(r[c])) > 200 else "")
+            row.append(Paragraph(val, styles["tiny"]))
+        data.append(row)
+
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e6eef9")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#0b3a75")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.HexColor("#fbfbfb")]),
+    ]))
+    elements.append(tbl)
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf.read()
+
+# -------------------- App setup --------------------
 st.set_page_config(page_title="IDS Alerts + Generative Summaries", layout="wide")
 
 # Default directory
@@ -96,12 +159,29 @@ def alerts_table(df: pd.DataFrame):
     st.subheader("Alerts")
     st.dataframe(df[cols].reset_index(drop=True), use_container_width=True, height=460)
 
+# CSV download helper
 def download_button(df: pd.DataFrame):
     st.download_button("⬇️ Download filtered CSV", data=df.to_csv(index=False), file_name="alerts_filtered.csv", mime="text/csv")
 
-# -------- UI --------
+# Executive mode helper: keep the first sentence (short)
+def first_sentence(text: str) -> str:
+    if not isinstance(text, str): 
+        return ""
+    m = re.search(r'(.+?[.!?])(\s|$)', text)
+    s = m.group(1).strip() if m else text.strip()
+    return (s[:180] + "…") if len(s) > 180 else s
+
+# -------------------- UI --------------------
 st.title("🔐 IDS Alerts + Generative Summaries")
 st.caption("CICIDS2017 • Detection → Generative Summary → Analyst Report")
+
+# Summary mode toggle
+mode = st.radio(
+    "Summary mode",
+    ["Executive (concise)", "SOC (detailed)"],
+    horizontal=True,
+    help="Executive = 1 sentence per alert. SOC = full multi-sentence summary."
+)
 
 uploaded = st.sidebar.file_uploader("Upload alerts CSV", type=["csv"])
 if uploaded is not None:
@@ -117,10 +197,31 @@ else:
 df = coerce_columns(df)
 st.info(src_msg)
 
+# KPIs
 kpis(df)
+
+# Filters + charts
 filtered = apply_filters(df)
 st.markdown("---"); charts(filtered)
-st.markdown("---"); alerts_table(filtered)
-download_button(filtered)
+
+# Build display copy (apply Executive trimming if chosen)
+display_df = filtered.copy()
+if "summary" in display_df.columns and mode.startswith("Executive"):
+    display_df["summary"] = display_df["summary"].apply(first_sentence)
+
+# Table
+st.markdown("---"); alerts_table(display_df)
+
+# Downloads (CSV + PDF)
+download_button(display_df)
+
+kpi_dict = {
+    "total": len(display_df),
+    "pct_high": f"{(display_df['severity'].str.lower()=='high').mean()*100:0.1f}%" if "severity" in display_df else "—",
+    "avg_conf": f"{display_df['confidence'].mean()*100:0.1f}%" if "confidence" in display_df else "—",
+    "avg_flesch": f"{display_df['readability_flesch'].mean():0.1f}" if "readability_flesch" in display_df else "—",
+}
+pdf_bytes = build_pdf(display_df, mode, kpi_dict, title="IDS Alerts + Generative Summaries")
+st.download_button("📄 Download PDF report", data=pdf_bytes, file_name="ids_alerts_report.pdf", mime="application/pdf")
 
 st.caption("Use the sidebar to filter by type, severity, model, confidence, and search text.")
