@@ -1,6 +1,6 @@
 # app.py — Generative AI–Powered Intrusion Detection System (IDS)
 
-import io, datetime as dt, re
+import io, os, time, datetime as dt, re
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +15,13 @@ from reportlab.lib.units import mm
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 )
+
+# ---- OpenAI (LLM) ----
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except Exception:
+    _OPENAI_AVAILABLE = False
 
 # ====================== PDF builder (branded) ======================
 def build_pdf(
@@ -254,6 +261,92 @@ def first_sentence(text: str) -> str:
     s = m.group(1).strip() if m else text.strip()
     return (s[:180] + "…") if len(s) > 180 else s
 
+# ====================== LLM Summarization ======================
+EXEC_PROMPT = """You are a security analyst. Produce a single-sentence executive summary (max ~35 words) of the following IDS alert for non-technical leaders. Be precise, avoid jargon, include impact and basic recommended response.
+{fields}
+"""
+
+SOC_PROMPT = """You are a SOC analyst. Produce a detailed, 2–3 sentence summary of the IDS alert, using clear plain language. Include: attack type, indicators, likely intent/impact, and 1–2 recommended actions. Avoid speculation; be specific.
+{fields}
+"""
+
+def make_fields_string(row: pd.Series) -> str:
+    fields = {
+        "Attack Type": row.get("attack_type", ""),
+        "Severity": row.get("severity", ""),
+        "Confidence": row.get("confidence", ""),
+        "Source IP": row.get("src_ip", ""),
+        "Destination IP": row.get("dst_ip", ""),
+        "Timestamp": row.get("timestamp", ""),
+        "Model": row.get("model", ""),
+    }
+    # mask IPs mildly (last octet)
+    def mask(ip):
+        if not isinstance(ip, str) or ip.count(".") != 3:
+            return ip
+        parts = ip.split("."); parts[-1] = "xxx"; return ".".join(parts)
+    fields["Source IP"] = mask(fields["Source IP"])
+    fields["Destination IP"] = mask(fields["Destination IP"])
+    return "\n".join([f"{k}: {v}" for k, v in fields.items() if str(v)])
+
+def build_prompt_for_row(row: pd.Series, mode_label: str) -> str:
+    base = SOC_PROMPT if mode_label.startswith("SOC") else EXEC_PROMPT
+    return base.format(fields=make_fields_string(row))
+
+@st.cache_data(show_spinner=False)
+def _model_choices_cached():
+    # sensible defaults that exist broadly
+    return ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
+
+def get_openai_client():
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY (set it in Streamlit secrets or env).")
+    if not _OPENAI_AVAILABLE:
+        raise RuntimeError("OpenAI SDK not installed. Add `openai>=1.40.0` to requirements.txt.")
+    return OpenAI(api_key=api_key)
+
+def generate_summaries_with_gpt(df: pd.DataFrame, mode: str, model: str, max_rows: int = 100, temperature: float = 0.2, delay_s: float = 0.2) -> pd.DataFrame:
+    """
+    Fills/overwrites 'summary' for up to max_rows entries in df that are missing or empty.
+    Returns a new DataFrame copy.
+    """
+    client = get_openai_client()
+    work = df.copy()
+    if "summary" not in work.columns:
+        work["summary"] = ""
+
+    # only rows needing summaries
+    need_mask = work["summary"].isna() | (work["summary"].astype(str).str.strip() == "")
+    idxs = work[need_mask].head(max_rows).index.tolist()
+    if not idxs:
+        return work
+
+    prog = st.progress(0, text=f"Generating {len(idxs)} summaries with {model} ({mode}) …")
+    for j, idx in enumerate(idxs, start=1):
+        row = work.loc[idx]
+        prompt = build_prompt_for_row(row, mode)
+        try:
+            # Chat Completions (widely available)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful cybersecurity assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=180,
+            )
+            summary_text = resp.choices[0].message.content.strip()
+            work.at[idx, "summary"] = summary_text
+        except Exception as e:
+            work.at[idx, "summary"] = f"(LLM error: {e})"
+        prog.progress(j / len(idxs))
+        time.sleep(delay_s)  # gentle pacing
+    prog.empty()
+    return work
+
+
 # ====================== UI ======================
 st.title("🔐 Generative AI–Powered Intrusion Detection System (IDS)")
 st.caption("DATA 675 – Generative AI | Marcel Dinga | University of Maryland Global Campus (UMGC)")
@@ -281,6 +374,21 @@ else:
 df = coerce_columns(df)
 st.info(src_msg)
 
+# ==== LLM controls ====
+with st.sidebar.expander("🤖 Generative AI (GPT)"):
+    st.write("Generate human-readable summaries from raw alert fields.")
+    model_choice = st.selectbox("Model", _model_choices_cached())
+    max_rows = st.slider("Max rows to generate", 10, 300, 100, step=10)
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, step=0.1)
+    do_generate = st.button("Generate summaries now")
+
+if do_generate:
+    try:
+        df = generate_summaries_with_gpt(df, mode, model_choice, max_rows=max_rows, temperature=temperature)
+        st.success(f"Summaries generated with {model_choice}.")
+    except Exception as e:
+        st.error(f"LLM generation failed: {e}")
+
 # KPIs + filters + charts
 kpis(df)
 filtered = apply_filters(df)
@@ -300,7 +408,7 @@ alerts_table(display_df)
 st.markdown("---")
 st.subheader("📦 Export report")
 
-# Always offer CSV
+# CSV
 csv_bytes = display_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="⬇️ Download filtered CSV",
@@ -318,7 +426,7 @@ kpi_dict = {
     "avg_flesch": f"{display_df['readability_flesch'].mean():0.1f}" if "readability_flesch" in display_df else "—",
 }
 
-# Try to build the PDF and surface any errors to the UI
+# PDF
 pdf_bytes, pdf_error = None, None
 try:
     pdf_bytes = build_pdf(
@@ -329,7 +437,7 @@ try:
         org_name="University of Maryland Global Campus (UMGC)",
         student_name="Marcel Dinga",
         course_name="DATA 675 – Generative AI",
-        logo_path="assets/logo.png",  # optional; skipped if not present
+        logo_path="assets/logo.png",  # optional
     )
 except Exception as e:
     pdf_error = str(e)
@@ -346,3 +454,5 @@ else:
     st.info("PDF not available yet.")
     if pdf_error:
         st.error(f"PDF generation error: {pdf_error}")
+
+st.caption("Use the sidebar to filter by type, severity, model, confidence, and search text.")
