@@ -296,15 +296,21 @@ if "summary" in display_df.columns and mode.startswith("Executive"):
 st.markdown("---")
 alerts_table(display_df)
 
-# Downloads
+# ---------------- EXPORT ----------------
+st.markdown("---")
+st.subheader("📦 Export report")
+
+# Always offer CSV
 csv_bytes = display_df.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "⬇️ Download filtered CSV",
+    label="⬇️ Download filtered CSV",
     data=csv_bytes,
     file_name="alerts_filtered.csv",
     mime="text/csv",
+    key="dl_csv",
 )
 
+# KPIs for PDF header
 kpi_dict = {
     "total": len(display_df),
     "pct_high": f"{(display_df['severity'].str.lower()=='high').mean()*100:0.1f}%" if "severity" in display_df else "—",
@@ -312,21 +318,31 @@ kpi_dict = {
     "avg_flesch": f"{display_df['readability_flesch'].mean():0.1f}" if "readability_flesch" in display_df else "—",
 }
 
-pdf_bytes = build_pdf(
-    display_df,
-    mode,
-    kpi_dict,
-    title="Generative AI–Powered Intrusion Detection System (IDS)",
-    org_name="University of Maryland Global Campus (UMGC)",
-    student_name="Marcel Dinga",
-    course_name="DATA 675 – Generative AI",
-    logo_path="assets/logo.png",  # optional; auto-skips if file not present
-)
-st.download_button(
-    "📄 Download PDF report",
-    data=pdf_bytes,
-    file_name="ids_alerts_report.pdf",
-    mime="application/pdf",
-)
+# Try to build the PDF and surface any errors to the UI
+pdf_bytes, pdf_error = None, None
+try:
+    pdf_bytes = build_pdf(
+        display_df,
+        mode,
+        kpi_dict,
+        title="Generative AI–Powered Intrusion Detection System (IDS)",
+        org_name="University of Maryland Global Campus (UMGC)",
+        student_name="Marcel Dinga",
+        course_name="DATA 675 – Generative AI",
+        logo_path="assets/logo.png",  # optional; skipped if not present
+    )
+except Exception as e:
+    pdf_error = str(e)
 
-st.caption("Use the sidebar to filter by type, severity, model, confidence, and search text.")
+if pdf_bytes:
+    st.download_button(
+        label="📄 Download PDF report",
+        data=pdf_bytes,
+        file_name="ids_alerts_report.pdf",
+        mime="application/pdf",
+        key="dl_pdf",
+    )
+else:
+    st.info("PDF not available yet.")
+    if pdf_error:
+        st.error(f"PDF generation error: {pdf_error}")
