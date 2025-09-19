@@ -1,6 +1,8 @@
-# app.py — Generative AI–Powered IDS Dashboard (single file)
-# Requirements: streamlit, pandas, altair  (add "altair>=5.0.0" to requirements.txt)
+# app.py — IDS Dashboard with AI Model Selector (single file)
+# Requirements: streamlit, pandas, altair>=5.0.0, openai>=1.30.0
 
+import os
+import json
 import pandas as pd
 import streamlit as st
 import altair as alt
@@ -75,34 +77,21 @@ div[data-testid="stMetric"] {
 # ---- Color palette ----
 # ================================
 PALETTE = {
-    "primary": "#2563eb",   # blue-600
-    "secondary": "#0ea5e9", # sky-500
-    "accent": "#8b5cf6",    # violet-500
-    "neutral": "#64748b",   # slate-500
-    "danger": "#ef4444",    # red-500
-    "success": "#10b981",   # emerald-500
-    "warning": "#f59e0b",   # amber-500
+    "primary": "#2563eb", "secondary": "#0ea5e9", "accent": "#8b5cf6",
+    "neutral": "#64748b", "danger": "#ef4444", "success": "#10b981", "warning": "#f59e0b",
 }
 ATTACK_COLORS = {
-    "BENIGN": "#2563eb",
-    "DoS": "#ef4444",
-    "DDoS": "#b91c1c",
-    "PortScan": "#8b5cf6",
-    "Bot": "#0ea5e9",
-    "WebAttack": "#f59e0b",
-    "FTP-Patator": "#10b981",
-    "SSH-Patator": "#14b8a6",
+    "BENIGN": "#2563eb", "DoS": "#ef4444", "DDoS": "#b91c1c", "PortScan": "#8b5cf6",
+    "Bot": "#0ea5e9", "WebAttack": "#f59e0b", "FTP-Patator": "#10b981", "SSH-Patator": "#14b8a6",
 }
 SEVERITY_COLORS = {"High": "#ef4444", "Medium": "#f59e0b", "Informational": "#2563eb"}
 
-# Expected columns (we’ll create empty ones if missing)
 EXPECTED_COLS = [
-    "timestamp", "attack_type", "severity", "confidence",
-    "src_ip", "dst_ip", "summary", "model", "readability_flesch"
+    "timestamp","attack_type","severity","confidence","src_ip","dst_ip","summary","model","readability_flesch"
 ]
 
 # ================================
-# ---- AI helpers (rules-based) ----
+# ---- AI helpers (rules + GPT) ----
 # ================================
 PLAYBOOK: Dict[str, str] = {
     "BENIGN": "No action required. Continue routine monitoring.",
@@ -144,36 +133,90 @@ def _rules_solution(attack_type: str) -> str:
         "Investigate in SIEM, review IDS/firewall logs, and escalate per incident response playbook."
     )
 
+def _gpt_summary_solution(attack_type: str, severity: str, confidence: float,
+                          src_ip: str, dst_ip: str, model_name: str, api_key: str) -> Tuple[str, str]:
+    """
+    Use OpenAI GPT to return (summary, proposed_action). Falls back to rules on error.
+    """
+    try:
+        os.environ["OPENAI_API_KEY"] = api_key or os.getenv("OPENAI_API_KEY", "")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("Missing OpenAI API key.")
+
+        # OpenAI v1 client (chat.completions)
+        from openai import OpenAI
+        client = OpenAI()
+
+        prompt = f"""
+You are a SOC analyst assistant.
+Write a concise plain-language SUMMARY and a short PROPOSED ACTION for this IDS alert.
+Fields: attack_type={attack_type}, severity={severity}, confidence={confidence}, src_ip={src_ip}, dst_ip={dst_ip}.
+Return strict JSON: {{"summary": "...", "proposed_action": "..."}}.
+If attack_type is BENIGN, proposed_action should be "No action required. Continue routine monitoring."
+Keep each value to 1–2 sentences.
+"""
+        resp = client.chat.completions.create(
+            model=model_name,
+            temperature=0.2,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content)
+        summary = data.get("summary") or _rules_summary(attack_type, severity, confidence, src_ip, dst_ip)
+        action  = data.get("proposed_action") or _rules_solution(attack_type)
+        return summary, action
+    except Exception:
+        # graceful fallback
+        return _rules_summary(attack_type, severity, confidence, src_ip, dst_ip), _rules_solution(attack_type)
+
 def generate_summary_and_solution(
     attack_type: str,
     severity: str,
     confidence: float,
     src_ip: str = None,
     dst_ip: str = None,
+    mode: str = "rules",
+    model_name: str = "gpt-4o-mini",
+    api_key: str = ""
 ) -> Tuple[str, str]:
-    return (
-        _rules_summary(attack_type, severity, confidence, src_ip, dst_ip),
-        _rules_solution(attack_type),
-    )
+    if mode == "gpt":
+        return _gpt_summary_solution(attack_type, severity, confidence, src_ip, dst_ip, model_name, api_key)
+    return _rules_summary(attack_type, severity, confidence, src_ip, dst_ip), _rules_solution(attack_type)
 
-def enrich_df_with_ai(df: pd.DataFrame) -> pd.DataFrame:
+def enrich_df_with_ai(df: pd.DataFrame, mode: str, model_name: str, api_key: str, max_gpt_rows: int = 200) -> pd.DataFrame:
+    """
+    Adds 'summary' and 'proposed_action'.
+    - rules mode: all rows via rules
+    - gpt mode: first N rows via GPT (max_gpt_rows), rest via rules for speed/cost
+    """
     if df is None or df.empty:
         return df
-    summaries, actions = [], []
-    for _, r in df.iterrows():
+
+    df = df.copy().reset_index(drop=True)
+    n = len(df)
+
+    summaries, actions = [""]*n, [""]*n
+    use_gpt = (mode == "gpt")
+    gpt_limit = min(max_gpt_rows, n) if use_gpt else 0
+
+    # First block (GPT or rules)
+    for i in range(n):
+        use_llm = use_gpt and (i < gpt_limit)
         s, a = generate_summary_and_solution(
-            str(r.get("attack_type", "")),
-            str(r.get("severity", "")),
-            float(r.get("confidence", 0) or 0),
-            r.get("src_ip"),
-            r.get("dst_ip"),
+            str(df.at[i, "attack_type"]) if "attack_type" in df.columns else "",
+            str(df.at[i, "severity"]) if "severity" in df.columns else "",
+            float(df.at[i, "confidence"]) if "confidence" in df.columns and pd.notna(df.at[i, "confidence"]) else 0.0,
+            df.at[i, "src_ip"] if "src_ip" in df.columns else None,
+            df.at[i, "dst_ip"] if "dst_ip" in df.columns else None,
+            mode="gpt" if use_llm else "rules",
+            model_name=model_name,
+            api_key=api_key,
         )
-        summaries.append(s)
-        actions.append(a)
-    out = df.copy()
-    out["summary"] = summaries
-    out["proposed_action"] = actions
-    return out
+        summaries[i], actions[i] = s, a
+
+    df["summary"] = summaries
+    df["proposed_action"] = actions
+    return df
 
 # ================================
 # ---- Charts (Altair) ----
@@ -192,8 +235,7 @@ def chart_counts_by_attack(df):
             y=alt.Y("count:Q", title="Count"),
             color=alt.Color("attack_type:N", scale=_cat_color_scale(ATTACK_COLORS), legend=None),
             tooltip=["attack_type:N","count:Q"]
-        )
-        .properties(height=320)
+        ).properties(height=320)
     )
 
 def chart_severity_share(df):
@@ -209,8 +251,7 @@ def chart_severity_share(df):
             y=alt.Y("count:Q", title="Count"),
             color=alt.Color("severity:N", scale=_cat_color_scale(SEVERITY_COLORS), legend=None),
             tooltip=["severity:N","count:Q", alt.Tooltip("share:Q", title="Share", format=".1%")]
-        )
-        .properties(height=320)
+        ).properties(height=320)
     )
 
 def chart_confidence(df):
@@ -224,8 +265,7 @@ def chart_confidence(df):
             x=alt.X("bin_conf:Q", title="Confidence", scale=alt.Scale(domain=[0,1])),
             y=alt.Y("count():Q", title="Frequency"),
             tooltip=[alt.Tooltip("count():Q", title="Count")]
-        )
-        .properties(height=260)
+        ).properties(height=260)
     )
 
 def chart_flesch(df):
@@ -243,116 +283,121 @@ def chart_flesch(df):
             x=alt.X("bin_f:Q", title="Readability (Flesch — higher is easier)"),
             y=alt.Y("count():Q", title="Frequency"),
             tooltip=[alt.Tooltip("count():Q", title="Count")]
-        )
-        .properties(height=260)
+        ).properties(height=260)
     )
 
 # ================================
 # ---- UI ----
 # ================================
-mode = st.radio("Summary mode", ["Executive (concise)", "SOC (detailed)"], horizontal=True)
+# Executive vs SOC (table columns & export)
+mode_view = st.radio("Summary mode", ["Executive (concise)", "SOC (detailed)"], horizontal=True)
 st.markdown("---")
 
-# File upload + info
-left, right = st.columns([1, 3], vertical_alignment="top")
-with left:
-    uploaded = st.file_uploader("Upload alerts CSV", type=["csv"], help="Limit 200MB per file • CSV")
-with right:
-    if uploaded is None:
-        st.info("No CSV found. Please upload one using the sidebar.")
+# Sidebar: File + Filters + AI model selection
+st.sidebar.header("Upload")
+uploaded = st.sidebar.file_uploader("Upload alerts CSV", type=["csv"], help="Limit 200MB per file • CSV")
+
+st.sidebar.header("Filters")
+# filters are built after loading df (since we need unique values)
+
+st.sidebar.header("🤖 Generative AI (Summaries)")
+summary_source = st.sidebar.radio("Summary source", ["Rules (offline)", "OpenAI GPT"], index=0)
+use_gpt = (summary_source == "OpenAI GPT")
+model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0, disabled=not use_gpt)
+max_gpt_rows = st.sidebar.slider("Max rows to summarize with GPT", 50, 1000, 200, 50, disabled=not use_gpt)
+
+# API key preference: st.secrets first, then env, then manual input
+prefilled_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+api_key = st.sidebar.text_input("OpenAI API Key", value=prefilled_key, type="password", disabled=not use_gpt,
+                                help="Prefer using st.secrets or environment variable. This field overrides if filled.")
+
+# Body content
+if uploaded is None:
+    st.info("No CSV found. Upload one from the sidebar.")
+else:
+    # Load
+    df = pd.read_csv(uploaded)
+
+    # Ensure expected columns exist
+    for c in EXPECTED_COLS:
+        if c not in df.columns:
+            df[c] = "" if c == "summary" else pd.NA
+
+    # Build Filters now that df is known
+    atk_all = sorted([x for x in df["attack_type"].dropna().unique().tolist()])
+    sev_all = sorted([x for x in df["severity"].dropna().unique().tolist()])
+    mdl_all = sorted([x for x in df["model"].dropna().unique().tolist()]) if "model" in df.columns else []
+
+    atk_sel = st.sidebar.multiselect("Attack type", atk_all, default=atk_all[:min(6, len(atk_all))])
+    sev_sel = st.sidebar.multiselect("Severity", sev_all, default=sev_all)
+    mdl_sel = st.sidebar.multiselect("Model (detector)", mdl_all, default=mdl_all) if mdl_all else mdl_all
+    conf_min, conf_max = st.sidebar.slider("Confidence range", 0.0, 1.0, (0.0, 1.0), step=0.01)
+
+    # Apply filters
+    dff = df.copy()
+    if atk_sel: dff = dff[dff["attack_type"].isin(atk_sel)]
+    if sev_sel: dff = dff[dff["severity"].isin(sev_sel)]
+    if mdl_sel: dff = dff[dff["model"].isin(mdl_sel)]
+    dff["confidence"] = pd.to_numeric(dff["confidence"], errors="coerce").fillna(0.0)
+    dff = dff[(dff["confidence"] >= conf_min) & (dff["confidence"] <= conf_max)]
+
+    # Enrich with AI summaries + actions
+    ai_mode = "gpt" if use_gpt else "rules"
+    dff = enrich_df_with_ai(dff, mode=ai_mode, model_name=model_name, api_key=api_key, max_gpt_rows=max_gpt_rows)
+
+    # KPIs
+    total_alerts = len(dff)
+    pct_high = (dff["severity"].eq("High").mean() * 100) if total_alerts else 0
+    avg_conf = dff["confidence"].mean() if total_alerts else 0
+    avg_flesch = pd.to_numeric(dff.get("readability_flesch", pd.Series(dtype=float)), errors="coerce").mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total alerts", f"{total_alerts:,}")
+    c2.metric("% High severity", f"{pct_high:.1f}%")
+    c3.metric("Avg confidence", f"{avg_conf:.1%}" if avg_conf <= 1.0 else f"{avg_conf:.3f}")
+    c4.metric("Avg Flesch score", f"{avg_flesch:.1f}")
+
+    st.markdown("### Visual insights")
+    v1, v2 = st.columns(2)
+    with v1:
+        st.markdown("**Counts by attack type**")
+        st.altair_chart(chart_counts_by_attack(dff), use_container_width=True)
+    with v2:
+        st.markdown("**Severity share**")
+        st.altair_chart(chart_severity_share(dff), use_container_width=True)
+
+    v3, v4 = st.columns(2)
+    with v3:
+        st.markdown("**Confidence distribution**")
+        st.altair_chart(chart_confidence(dff), use_container_width=True)
+    with v4:
+        ch = chart_flesch(dff)
+        if ch is not None:
+            st.markdown("**Readability (Flesch) distribution**")
+            st.altair_chart(ch, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Alerts")
+
+    # Columns to display/export
+    display_cols = [
+        "timestamp","attack_type","severity","confidence","src_ip","dst_ip","summary","model","readability_flesch"
+    ]
+    if mode_view == "SOC (detailed)":
+        insert_at = display_cols.index("model")
+        display_cols.insert(insert_at, "proposed_action")
+    display_cols = [c for c in display_cols if c in dff.columns]
+
+    st.dataframe(dff[display_cols], use_container_width=True, height=520)
+
+    # Export CSV (matches current view)
+    csv_bytes = dff[display_cols].to_csv(index=False).encode("utf-8")
+    st.download_button("Download filtered CSV", data=csv_bytes, file_name="alerts_filtered.csv", mime="text/csv")
+
+    # Helpful tips
+    if use_gpt and not api_key:
+        st.warning("OpenAI GPT selected, but no API key provided. Add it in the sidebar or via st.secrets / environment variable.")
+    if use_gpt:
+        st.caption(f"GPT model: {model_name} • Summarized up to {max_gpt_rows} rows with GPT; remaining rows use rules for speed/cost.")
     else:
-        # Load
-        df = pd.read_csv(uploaded)
-
-        # Ensure expected columns exist
-        for c in EXPECTED_COLS:
-            if c not in df.columns:
-                if c == "summary":
-                    df[c] = ""
-                else:
-                    df[c] = pd.NA
-
-        # Sidebar filters
-        st.sidebar.header("Filters")
-        atk_all = sorted([x for x in df["attack_type"].dropna().unique().tolist()])
-        sev_all = sorted([x for x in df["severity"].dropna().unique().tolist()])
-        mdl_all = sorted([x for x in df["model"].dropna().unique().tolist()]) if "model" in df.columns else []
-
-        atk_sel = st.sidebar.multiselect("Attack type", atk_all, default=atk_all[:min(6, len(atk_all))])
-        sev_sel = st.sidebar.multiselect("Severity", sev_all, default=sev_all)
-        mdl_sel = st.sidebar.multiselect("Model", mdl_all, default=mdl_all) if mdl_all else mdl_all
-        conf_min, conf_max = st.sidebar.slider("Confidence range", 0.0, 1.0, (0.0, 1.0), step=0.01)
-
-        # Apply filters
-        dff = df.copy()
-        if atk_sel:
-            dff = dff[dff["attack_type"].isin(atk_sel)]
-        if sev_sel:
-            dff = dff[dff["severity"].isin(sev_sel)]
-        if mdl_sel:
-            dff = dff[dff["model"].isin(mdl_sel)]
-        dff["confidence"] = pd.to_numeric(dff["confidence"], errors="coerce").fillna(0.0)
-        dff = dff[(dff["confidence"] >= conf_min) & (dff["confidence"] <= conf_max)]
-
-        # Enrich with AI (summary + proposed_action)
-        dff = enrich_df_with_ai(dff)
-
-        # KPIs
-        total_alerts = len(dff)
-        pct_high = (dff["severity"].eq("High").mean() * 100) if total_alerts else 0
-        avg_conf = dff["confidence"].mean() if total_alerts else 0
-        avg_flesch = dff["readability_flesch"].astype(float).mean() if "readability_flesch" in dff.columns and total_alerts else 0
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total alerts", f"{total_alerts:,}")
-        m2.metric("% High severity", f"{pct_high:.1f}%")
-        m3.metric("Avg confidence", f"{avg_conf:.1%}" if avg_conf <= 1.0 else f"{avg_conf:.3f}")
-        m4.metric("Avg Flesch score", f"{avg_flesch:.1f}")
-
-        st.markdown("### Visual insights")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Counts by attack type**")
-            st.altair_chart(chart_counts_by_attack(dff), use_container_width=True)
-        with c2:
-            st.markdown("**Severity share**")
-            st.altair_chart(chart_severity_share(dff), use_container_width=True)
-
-        c3, c4 = st.columns(2)
-        with c3:
-            st.markdown("**Confidence distribution**")
-            st.altair_chart(chart_confidence(dff), use_container_width=True)
-        with c4:
-            ch = chart_flesch(dff)
-            if ch is not None:
-                st.markdown("**Readability (Flesch) distribution**")
-                st.altair_chart(ch, use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("Alerts")
-
-        # Columns to display/export
-        display_cols = [
-            "timestamp", "attack_type", "severity", "confidence",
-            "src_ip", "dst_ip", "summary", "model", "readability_flesch"
-        ]
-        if mode == "SOC (detailed)":
-            insert_at = display_cols.index("model")
-            display_cols.insert(insert_at, "proposed_action")
-
-        # Only keep existing columns
-        display_cols = [c for c in display_cols if c in dff.columns]
-
-        # Table
-        st.dataframe(dff[display_cols], use_container_width=True, height=520)
-
-        # Export CSV (matches current view)
-        csv_bytes = dff[display_cols].to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download filtered CSV",
-            data=csv_bytes,
-            file_name="alerts_filtered.csv",
-            mime="text/csv"
-        )
-
-        st.caption("Tip: Switch Executive/SOC mode to change table & export columns.")
+        st.caption("Using rules-based summaries (offline).")
