@@ -1,8 +1,9 @@
 streamlit>=1.33,<2
 pandas>=2.0
 numpy>=1.24
-textstat>=0.7
-reportlab>=3.6
-openai>=1.40.0
 altair>=5.0.0
+openai>=1.40.0
+reportlab>=3.6
+textstat>=0.7
+
 
